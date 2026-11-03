@@ -14,7 +14,7 @@ app.get("/", (req, res) => {
 
 const client = new MongoClient(process.env.MONGODB_URI); 
 
-export async function connectToMongoDB() {
+async function connectToMongoDB() {
   try {
     await client.connect();
     console.log("You successfully connected to MongoDB!");
