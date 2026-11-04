@@ -96,9 +96,9 @@ app.post("/events", async (req, res) => {
             location: location.trim(),
             thumbnail: thumbnail.trim(),
             description: description.trim(),
-            // organizerId: req.user.id,
-            // organizerName: req.user.name,
-            // organizerEmail: req.user.email,
+            organizerId: req.user.id,
+            organizerName: req.user.name,
+            organizerEmail: req.user.email,
             createdAt: new Date(),
         };
 
@@ -129,6 +129,54 @@ app.get("/events/:id", async (req, res) => {
     } catch (error) {
         console.error("Failed to fetch Events:", error);
         return res.status(500).json({ message: "Failed to fetch Events." });
+    }
+});
+
+
+// Returns only the events created by the logged-in user
+app.get("/my-events", async (req, res) => {
+    try {
+        const events = await eventCollection
+            .find({ organizerId: req.user.id })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        // Expose _id as id so the frontend gets the EventItem shape directly
+        res.json({
+            events: events.map(({ _id, ...rest }) => ({
+                id: _id.toString(),
+                ...rest,
+            })),
+        });
+    } catch (error) {
+        console.error("Failed to fetch user events:", error);
+        res.status(500).json({ message: "Failed to fetch your events." });
+    }
+});
+
+// Deletes an event only if it belongs to the logged-in user
+app.delete("/events/:id", async (req, res) => {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid event ID." });
+    }
+
+    try {
+        const result = await eventCollection.deleteOne({
+            _id: new ObjectId(id),
+            organizerId: req.user.id,
+        });
+
+        // Same response for "missing" and "not yours" so ownership is not leaked
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: "Event not found." });
+        }
+
+        res.json({ message: "Event deleted." });
+    } catch (error) {
+        console.error("Failed to delete event:", error);
+        res.status(500).json({ message: "Failed to delete the event." });
     }
 });
 
