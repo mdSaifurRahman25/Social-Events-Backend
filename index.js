@@ -1,5 +1,5 @@
 import express from "express";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import cors from "cors";
 
@@ -17,7 +17,7 @@ await client.connect();
 console.log("You successfully connected to MongoDB!");
 
 const db = client.db("kindred");
-const eventDestination = db.collection("events");
+const eventCollection = db.collection("events");
 
 // Helpers
 const EVENT_TYPES = [
@@ -72,7 +72,7 @@ app.get("/", (req, res) => {
 
 app.get("/events", async (req, res) => {
     try {
-        const events = await eventDestination.find({}).sort({ date: 1 }).toArray();
+        const events = await eventCollection.find({}).sort({ date: 1 }).toArray();
         res.json(events);
     } catch (error) {
         console.error(error);
@@ -102,11 +102,33 @@ app.post("/events", async (req, res) => {
             createdAt: new Date(),
         };
 
-        const result = await eventDestination.insertOne(event);
+        const result = await eventCollection.insertOne(event);
         res.status(201).json({ id: result.insertedId });
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: "Could not save the event." });
+    }
+});
+
+app.get("/events/:id", async (req, res) => {
+    const { id } = req.params;
+    // console.log(id, 'from index.js event id api');
+
+    if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid Events ID." });
+    }
+
+    try {
+        const result = await eventCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!result) {
+            return res.status(404).json({ message: "Events not found." });
+        }
+
+        return res.json({ result });
+    } catch (error) {
+        console.error("Failed to fetch Events:", error);
+        return res.status(500).json({ message: "Failed to fetch Events." });
     }
 });
 
