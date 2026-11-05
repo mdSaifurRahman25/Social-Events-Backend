@@ -2,6 +2,7 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import cors from "cors";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const port = process.env.PORT || 8000;
@@ -63,7 +64,31 @@ const validateEvent = (body) => {
     return null;
 };
 
+// JWT Token Verification 
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    // console.log(authHeader, 'from jwt verify APi ');
+    if (!authHeader) {
+        return res.status(401).send({ message: 'Unauthorized authHeader' })
+    }
 
+    const token = authHeader.split(" ")[1];
+    // console.log(token, 'from split function.');
+    if (!token) {
+        return res.status(401).send({ message: 'Unauthorized Token' })
+    };
+
+    const JWKS = createRemoteJWKSet(new URL('http://localhost:3000/api/auth/jwks'));
+
+    try {
+        const { payload } = await jwtVerify(token, JWKS);
+        // console.log(payload, 'from payload function');
+        next();
+    } catch (error) {
+        return res.status(500).send({ message: 'Internal server error!' });
+    }
+
+}
 
 // API
 app.get("/", (req, res) => {
@@ -80,14 +105,33 @@ app.get("/events", async (req, res) => {
     }
 });
 
-app.post("/events", async (req, res) => {
+
+app.post("/events", verifyToken, async (req, res) => {
     const problem = validateEvent(req.body);
     if (problem) {
         return res.status(400).json({ message: problem });
     }
 
     try {
-        const { title, type, date, location, thumbnail, description } = req.body;
+        const {
+            title,
+            type,
+            date,
+            location,
+            thumbnail,
+            description,
+            organizerId,
+            organizerName,
+            organizerEmail,
+        } = req.body;
+
+        if (
+            !hasMinLength(organizerId, 1) ||
+            !hasMinLength(organizerName, 1) ||
+            !hasMinLength(organizerEmail, 3)
+        ) {
+            return res.status(400).json({ message: "Organizer details are required." });
+        }
 
         const event = {
             title: title.trim(),
@@ -96,9 +140,9 @@ app.post("/events", async (req, res) => {
             location: location.trim(),
             thumbnail: thumbnail.trim(),
             description: description.trim(),
-            organizerId: req.user.id,
-            organizerName: req.user.name,
-            organizerEmail: req.user.email,
+            organizerId: organizerId.trim(),
+            organizerName: organizerName.trim(),
+            organizerEmail: organizerEmail.trim(),
             createdAt: new Date(),
         };
 
@@ -110,7 +154,7 @@ app.post("/events", async (req, res) => {
     }
 });
 
-app.get("/events/:id", async (req, res) => {
+app.get("/events/:id", verifyToken, async (req, res) => {
     const { id } = req.params;
     // console.log(id, 'from index.js event id api');
 
@@ -133,11 +177,17 @@ app.get("/events/:id", async (req, res) => {
 });
 
 
-// Returns only the events created by the logged-in user
-app.get("/my-events", async (req, res) => {
+// Returns only the events whose organizerId matches the query string
+app.get("/my-events", verifyToken, async (req, res) => {
+    const { organizerId } = req.query;
+
+    if (typeof organizerId !== "string" || !organizerId.trim()) {
+        return res.status(400).json({ message: "organizerId is required." });
+    }
+
     try {
         const events = await eventCollection
-            .find({ organizerId: req.user.id })
+            .find({ organizerId: organizerId.trim() })
             .sort({ createdAt: -1 })
             .toArray();
 
@@ -154,18 +204,24 @@ app.get("/my-events", async (req, res) => {
     }
 });
 
-// Deletes an event only if it belongs to the logged-in user
-app.delete("/events/:id", async (req, res) => {
+
+// Deletes an event only if its organizerId matches the query string
+app.delete("/events/:id", verifyToken, async (req, res) => {
     const { id } = req.params;
+    const { organizerId } = req.query;
 
     if (!ObjectId.isValid(id)) {
         return res.status(400).json({ message: "Invalid event ID." });
     }
 
+    if (typeof organizerId !== "string" || !organizerId.trim()) {
+        return res.status(400).json({ message: "organizerId is required." });
+    }
+
     try {
         const result = await eventCollection.deleteOne({
             _id: new ObjectId(id),
-            organizerId: req.user.id,
+            organizerId: organizerId.trim(),
         });
 
         // Same response for "missing" and "not yours" so ownership is not leaked
@@ -177,6 +233,54 @@ app.delete("/events/:id", async (req, res) => {
     } catch (error) {
         console.error("Failed to delete event:", error);
         res.status(500).json({ message: "Failed to delete the event." });
+    }
+});
+
+// Updates an event only if its organizerId matches the query string
+app.put("/events/:id", verifyToken, async (req, res) => {
+    const { id } = req.params;
+    const { organizerId } = req.query;
+ 
+    if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid event ID." });
+    }
+ 
+    if (typeof organizerId !== "string" || !organizerId.trim()) {
+        return res.status(400).json({ message: "organizerId is required." });
+    }
+ 
+    const problem = validateEvent(req.body);
+    if (problem) {
+        return res.status(400).json({ message: problem });
+    }
+ 
+    try {
+        const { title, type, date, location, thumbnail, description } = req.body;
+ 
+        const result = await eventCollection.updateOne(
+            { _id: new ObjectId(id), organizerId: organizerId.trim() },
+            {
+                $set: {
+                    title: title.trim(),
+                    type,
+                    date,
+                    location: location.trim(),
+                    thumbnail: thumbnail.trim(),
+                    description: description.trim(),
+                    updatedAt: new Date(),
+                },
+            }
+        );
+ 
+        // Same response for "missing" and "not yours" so ownership is not leaked
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "Event not found." });
+        }
+ 
+        res.json({ message: "Event updated." });
+    } catch (error) {
+        console.error("Failed to update event:", error);
+        res.status(500).json({ message: "Failed to update the event." });
     }
 });
 
