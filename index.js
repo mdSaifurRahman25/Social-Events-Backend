@@ -72,6 +72,8 @@ const validateEvent = (body) => {
 // JWT Token Verification (JWKS client is created once)
 const JWKS = createRemoteJWKSet(new URL(`${clientUrl}/api/auth/jwks`));
 
+
+// Token verification
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) {
@@ -96,6 +98,27 @@ const verifyToken = async (req, res, next) => {
     }
 };
 
+// Like verifyToken, but lets logged-out visitors through (req.user stays undefined)
+const optionalAuth = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.split(" ")[1];
+
+    if (!token) return next();
+
+    try {
+        const { payload } = await jwtVerify(token, JWKS);
+        req.user = {
+            id: String(payload.id ?? payload.sub ?? ""),
+            name: payload.name,
+            email: payload.email,
+        };
+    } catch {
+        // Invalid or expired token: treat the visitor as logged out
+    }
+
+    next();
+};
+
 // API
 app.get("/", (req, res) => {
     res.send("API is working");
@@ -103,13 +126,18 @@ app.get("/", (req, res) => {
 
 
 
-// Home page 6 recent events 
-// Latest 6 events by creation time (public, organizer email is not exposed)
+// Home page: the 6 nearest upcoming events (today or later), soonest first
 app.get("/recent-events", async (req, res) => {
     try {
+        // Same "today" rule as validateEvent (YYYY-MM-DD compares correctly as a string)
+        const today = new Date().toISOString().slice(0, 10);
+
         const events = await eventCollection
-            .find({}, { projection: { organizerEmail: 0 } })
-            .sort({ createdAt: -1, _id: -1 })
+            .find(
+                { date: { $gte: today } },
+                { projection: { organizerEmail: 0 } }
+            )
+            .sort({ date: 1, createdAt: -1 })
             .limit(6)
             .toArray();
 
@@ -136,33 +164,21 @@ app.get("/events", async (req, res) => {
     }
 });
 
-
 app.post("/events", verifyToken, async (req, res) => {
     const problem = validateEvent(req.body);
     if (problem) {
         return res.status(400).json({ message: problem });
     }
 
-    try {
-        const {
-            title,
-            type,
-            date,
-            location,
-            thumbnail,
-            description,
-            organizerId,
-            organizerName,
-            organizerEmail,
-        } = req.body;
+    // The organizer comes from the verified token, never from the request body
+    const { id: organizerId, name: organizerName, email: organizerEmail } = req.user;
 
-        if (
-            !hasMinLength(organizerId, 1) ||
-            !hasMinLength(organizerName, 1) ||
-            !hasMinLength(organizerEmail, 3)
-        ) {
-            return res.status(400).json({ message: "Organizer details are required." });
-        }
+    if (!organizerId || !organizerName || !organizerEmail) {
+        return res.status(400).json({ message: "Organizer details are required." });
+    }
+
+    try {
+        const { title, type, date, location, thumbnail, description } = req.body;
 
         const event = {
             title: title.trim(),
@@ -171,9 +187,9 @@ app.post("/events", verifyToken, async (req, res) => {
             location: location.trim(),
             thumbnail: thumbnail.trim(),
             description: description.trim(),
-            organizerId: organizerId.trim(),
-            organizerName: organizerName.trim(),
-            organizerEmail: organizerEmail.trim(),
+            organizerId,
+            organizerName,
+            organizerEmail,
             createdAt: new Date(),
         };
 
@@ -186,8 +202,103 @@ app.post("/events", verifyToken, async (req, res) => {
 });
 
 
-// get single event details
-app.get("/events/:id", verifyToken, async (req, res) => {
+// Returns only the events created by the logged-in user
+app.get("/my-events", verifyToken, async (req, res) => {
+    try {
+        const events = await eventCollection
+            .find({ organizerId: req.user.id })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        // Expose _id as id so the frontend gets the EventItem shape directly
+        res.json({
+            events: events.map(({ _id, ...rest }) => ({
+                id: _id.toString(),
+                ...rest,
+            })),
+        });
+    } catch (error) {
+        console.error("Failed to fetch user events:", error);
+        res.status(500).json({ message: "Failed to fetch your events." });
+    }
+});
+
+
+// Deletes an event only if the logged-in user created it
+app.delete("/events/:id", verifyToken, async (req, res) => {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid event ID." });
+    }
+
+    try {
+        const result = await eventCollection.deleteOne({
+            _id: new ObjectId(id),
+            organizerId: req.user.id,
+        });
+
+        // Same response for "missing" and "not yours" so ownership is not leaked
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: "Event not found." });
+        }
+
+        // Remove the joins of the deleted event so no orphan records are left
+        await joinCollection.deleteMany({ eventId: new ObjectId(id) });
+
+        res.json({ message: "Event deleted." });
+    } catch (error) {
+        console.error("Failed to delete event:", error);
+        res.status(500).json({ message: "Failed to delete the event." });
+    }
+});
+
+
+// Updates an event only if the logged-in user created it
+app.put("/events/:id", verifyToken, async (req, res) => {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid event ID." });
+    }
+
+    const problem = validateEvent(req.body);
+    if (problem) {
+        return res.status(400).json({ message: problem });
+    }
+
+    try {
+        const { title, type, date, location, thumbnail, description } = req.body;
+
+        const result = await eventCollection.updateOne(
+            { _id: new ObjectId(id), organizerId: req.user.id },
+            {
+                $set: {
+                    title: title.trim(),
+                    type,
+                    date,
+                    location: location.trim(),
+                    thumbnail: thumbnail.trim(),
+                    description: description.trim(),
+                    updatedAt: new Date(),
+                },
+            }
+        );
+
+        // Same response for "missing" and "not yours" so ownership is not leaked
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "Event not found." });
+        }
+
+        res.json({ message: "Event updated." });
+    } catch (error) {
+        console.error("Failed to update event:", error);
+        res.status(500).json({ message: "Failed to update the event." });
+    }
+});
+
+// get single event details (public, joinedByMe is only computed for logged-in users)
+app.get("/events/:id", optionalAuth, async (req, res) => {
     const { id } = req.params;
 
     if (!ObjectId.isValid(id)) {
@@ -201,13 +312,17 @@ app.get("/events/:id", verifyToken, async (req, res) => {
             return res.status(404).json({ message: "Events not found." });
         }
 
-        // Check whether the logged-in user has joined this event
-        const joined = await joinCollection.findOne({
-            eventId: result._id,
-            userId: req.user.id,
-        });
+        let joinedByMe = false;
 
-        return res.json({ result: { ...result, joinedByMe: !!joined } });
+        if (req.user?.id) {
+            const joined = await joinCollection.findOne({
+                eventId: result._id,
+                userId: req.user.id,
+            });
+            joinedByMe = !!joined;
+        }
+
+        return res.json({ result: { ...result, joinedByMe } });
     } catch (error) {
         console.error("Failed to fetch Events:", error);
         return res.status(500).json({ message: "Failed to fetch Events." });
